@@ -417,7 +417,7 @@ func (t StorageClassTest) TestDynamicProvisioning() *v1.PersistentVolume {
 		var waitErr error
 		wait.Poll(pdRetryPollTime, pdRetryTimeout, func() (bool, error) {
 			var pod *v1.Pod
-			pod, err := e2epod.CreateSecPod(client, podConfig, 30*time.Second)
+			pod, err := e2epod.CreateSecPod(client, podConfig, framework.PodStartTimeout)
 			waitErr = err
 
 			// Delete pod now, otherwise PV can't be deleted below
