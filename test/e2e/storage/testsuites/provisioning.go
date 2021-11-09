@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
@@ -411,12 +412,23 @@ func (t StorageClassTest) TestDynamicProvisioning() *v1.PersistentVolume {
 			PVCs:          []*v1.PersistentVolumeClaim{claim},
 			NodeSelection: t.NodeSelection,
 		}
+		pdRetryTimeout := 10 * time.Minute
+		pdRetryPollTime := 10 * time.Second
+		var waitErr error
+		wait.Poll(pdRetryPollTime, pdRetryTimeout, func() (bool, error) {
+			var pod *v1.Pod
+			pod, err := e2epod.CreateSecPod(client, podConfig, 30*time.Second)
+			waitErr = err
 
-		var pod *v1.Pod
-		pod, err := e2epod.CreateSecPod(client, podConfig, framework.PodStartTimeout)
-		// Delete pod now, otherwise PV can't be deleted below
-		framework.ExpectNoError(err)
-		e2epod.DeletePodOrFail(client, pod.Namespace, pod.Name)
+			// Delete pod now, otherwise PV can't be deleted below
+			e2epod.DeletePodOrFail(client, pod.Namespace, pod.Name)
+			if err == nil {
+				return true, nil
+			} else {
+				return false, nil
+			}
+		})
+		framework.ExpectNoError(waitErr)
 	}
 
 	// Run the checker
