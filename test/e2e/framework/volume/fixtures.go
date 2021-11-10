@@ -538,6 +538,10 @@ func InjectContent(f *framework.Framework, config TestConfig, fsGroup *int64, fs
 		framework.Failf("Failed to create injector pod: %v", err)
 		return
 	}
+	// We wait for pod to dissapear before pod inject content is done
+	//if volume is being detached then the cloning will fail, you can't clone while there is an operation going on on the disk
+
+	// InjectorContent calls runVolumeTesterPod which waits for
 	defer func() {
 		e2epod.DeletePodOrFail(f.ClientSet, injectorPod.Namespace, injectorPod.Name)
 		e2epod.WaitForPodToDisappear(f.ClientSet, injectorPod.Namespace, injectorPod.Name, labels.Everything(), framework.Poll, timeouts.PodDelete)

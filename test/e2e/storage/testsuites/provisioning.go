@@ -19,6 +19,7 @@ package testsuites
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,7 +32,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
@@ -270,10 +270,23 @@ func (p *provisioningTestSuite) DefineTests(driver storageframework.TestDriver, 
 			}
 			e2evolume.TestVolumeClientSlow(f, testConfig, nil, "", tests)
 		}
+
+		// For GCE PD, cloning fails if the source disk has another operation going on. When we try create the clone in TestDynamicProvisioning,
+		// the source disk could still be in the process of detaching since InjectContent in preparePVCDataSourceForProvisioning defers
+		// deleting the injector pod. To verify the disk is ready, we create a pod with the source claim and wait for the pod to be ready.
+		source, _ := l.cs.CoreV1().PersistentVolumeClaims(l.sourcePVC.Namespace).Create(context.TODO(), l.sourcePVC, metav1.CreateOptions{})
+		pod, _ := e2epod.CreatePod(l.cs, source.Namespace, nil /* nodeSelector */, []*v1.PersistentVolumeClaim{source}, true /* isPrivileged */, "while true ; do sleep 2; done" /* command */)
+		defer func() {
+			e2epod.DeletePodOrFail(l.testCase.Client, pod.Namespace, pod.Name)
+			e2epod.WaitForPodToDisappear(l.testCase.Client, pod.Namespace, pod.Name, labels.Everything(), framework.Poll, f.Timeouts.PodDelete)
+		}()
 		l.testCase.TestDynamicProvisioning()
 	})
 
 	ginkgo.It("should provision storage with pvc data source in parallel [Slow]", func() {
+		if strings.HasPrefix(dInfo.Name, "csi-gcepd") {
+			e2eskipper.Skipf("Driver %q does not support cloning in parallel due to the rate limit GCE has for the cloning frequency per disk - skipping", dInfo.Name)
+		}
 		// Test cloning a single volume multiple times.
 		if !dInfo.Capabilities[storageframework.CapPVCDataSource] {
 			e2eskipper.Skipf("Driver %q does not support cloning - skipping", dInfo.Name)
@@ -404,6 +417,32 @@ func (t StorageClassTest) TestDynamicProvisioning() *v1.PersistentVolume {
 	// ensure that the claim refers to the provisioned StorageClass
 	framework.ExpectEqual(*claim.Spec.StorageClassName, class.Name)
 
+	// // if late binding is configured, create and delete a pod to provision the volume
+	// if *class.VolumeBindingMode == storagev1.VolumeBindingWaitForFirstConsumer {
+	// 	ginkgo.By(fmt.Sprintf("creating a pod referring to the class=%+v claim=%+v", class, claim))
+	// 	var podConfig *e2epod.Config = &e2epod.Config{
+	// 		NS:            claim.Namespace,
+	// 		PVCs:          []*v1.PersistentVolumeClaim{claim},
+	// 		NodeSelection: t.NodeSelection,
+	// 	}
+	// 	pdRetryTimeout := 10 * time.Minute
+	// 	pdRetryPollTime := 10 * time.Second
+	// 	var waitErr error
+	// 	wait.Poll(pdRetryPollTime, pdRetryTimeout, func() (bool, error) {
+	// 		var pod *v1.Pod
+	// 		pod, err := e2epod.CreateSecPod(client, podConfig, 30*time.Second)
+	// 		waitErr = err
+
+	// 		// Delete pod now, otherwise PV can't be deleted below
+	// 		e2epod.DeletePodOrFail(client, pod.Namespace, pod.Name)
+	// 		if err == nil {
+	// 			return true, nil
+	// 		} else {
+	// 			return false, nil
+	// 		}
+	// 	})
+	// 	framework.ExpectNoError(waitErr)
+	// }
 	// if late binding is configured, create and delete a pod to provision the volume
 	if *class.VolumeBindingMode == storagev1.VolumeBindingWaitForFirstConsumer {
 		ginkgo.By(fmt.Sprintf("creating a pod referring to the class=%+v claim=%+v", class, claim))
@@ -412,23 +451,12 @@ func (t StorageClassTest) TestDynamicProvisioning() *v1.PersistentVolume {
 			PVCs:          []*v1.PersistentVolumeClaim{claim},
 			NodeSelection: t.NodeSelection,
 		}
-		pdRetryTimeout := 10 * time.Minute
-		pdRetryPollTime := 10 * time.Second
-		var waitErr error
-		wait.Poll(pdRetryPollTime, pdRetryTimeout, func() (bool, error) {
-			var pod *v1.Pod
-			pod, err := e2epod.CreateSecPod(client, podConfig, 30*time.Second)
-			waitErr = err
 
-			// Delete pod now, otherwise PV can't be deleted below
-			e2epod.DeletePodOrFail(client, pod.Namespace, pod.Name)
-			if err == nil {
-				return true, nil
-			} else {
-				return false, nil
-			}
-		})
-		framework.ExpectNoError(waitErr)
+		var pod *v1.Pod
+		pod, err := e2epod.CreateSecPod(client, podConfig, framework.PodStartTimeout)
+		// Delete pod now, otherwise PV can't be deleted below
+		framework.ExpectNoError(err)
+		e2epod.DeletePodOrFail(client, pod.Namespace, pod.Name)
 	}
 
 	// Run the checker
@@ -942,6 +970,8 @@ func preparePVCDataSourceForProvisioning(
 			ExpectedContent: injectContent,
 		},
 	}
+	// Inside InjectContent, it defers deleting the pod until after it returns, so once we go into TestDynamicProvisioning,
+	// the volume is still being detached so cloning will fail, you can't clone while there is an operation going on on the disk.
 	e2evolume.InjectContent(f, config, nil, "", tests)
 
 	dataSourceRef := &v1.TypedLocalObjectReference{
